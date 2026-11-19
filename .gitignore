@@ -1,0 +1,69 @@
+# Python environments and generated files
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+secrets/
+credentials/
+*.pem
+*.key
+
+# Confidential documents and local data
+private/
+confidential/
+private_documents/
+confidential_documents/
+sensitive/
+docs/private/
+docs/confidential/
+*.private.*
+*.confidential.*
+*.sensitive.*
+data/
+local_data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+
+# Logs, processing output, and generated artifacts
+logs/
+outputs/
+results/
+processed/
+artifacts/
+*.log
+
+# Local AI model files and caches
+models/
+model_cache/
+*.gguf
+*.ggml
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.tflite
+*.bin
+*.model
+*.pkl
+*.pickle
+
+# Editor and operating-system files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

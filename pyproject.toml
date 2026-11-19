@@ -1,0 +1,6 @@
+[project]
+name = "local-ai-project"
+version = "0.1.0"
+description = "Local-first project scaffold for the Lenovo IdeaPad Slim 5i target."
+requires-python = ">=3.11"
+dependencies = []
