@@ -119,6 +119,13 @@ class ProcurementItem:
                 raise ValidationError("quantity must be a Decimal")
             if not self.quantity.is_finite() or self.quantity <= Decimal("0"):
                 raise ValidationError("quantity must be a finite Decimal greater than zero")
+        if self.unit is not None:
+            if not isinstance(self.unit, str):
+                raise ValidationError("unit must be a string")
+            unit = self.unit.strip()
+            if not unit:
+                raise ValidationError("unit must not be empty")
+            object.__setattr__(self, "unit", unit)
 
     @classmethod
     def _reconstitute(

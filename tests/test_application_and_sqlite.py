@@ -26,7 +26,7 @@ class ApplicationSqliteTests(unittest.TestCase):
             database = SqliteDatabase(Path(directory) / "test.sqlite3")
             app = PriceCheckerApplication(lambda: SqliteUnitOfWork(database))
             run = app.create_review_run(CreateReviewRunCommand())
-            item = app.add_procurement_item(AddProcurementItemCommand(run.id, "SSD", quantity=Decimal("2")))
+            item = app.add_procurement_item(AddProcurementItemCommand(run.id, "SSD", quantity=Decimal("2"), unit="шт."))
             self.assertEqual(item.name, "SSD")
             self.assertEqual(app.dashboard()[0].item_count, 1)
             with database.transaction() as connection:
@@ -67,7 +67,7 @@ class ApplicationSqliteTests(unittest.TestCase):
 
             failing_app = PriceCheckerApplication(lambda: FailingUnitOfWork(database))
             with self.assertRaises(RuntimeError):
-                failing_app.add_procurement_item(AddProcurementItemCommand(run.id, "SSD", quantity=Decimal("2")))
+                failing_app.add_procurement_item(AddProcurementItemCommand(run.id, "SSD", quantity=Decimal("2"), unit="шт."))
             with database.transaction() as connection:
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM procurement_items").fetchone()[0], 0)
 

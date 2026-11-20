@@ -23,4 +23,5 @@ class ProcurementItemDto:
     quantity: Decimal | None
     unit: str | None
     status: ProcurementItemStatus
+    created_at: datetime
 
