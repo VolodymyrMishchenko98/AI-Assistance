@@ -77,7 +77,7 @@ class ApplicationSqliteTests(unittest.TestCase):
             database = SqliteDatabase(root / "test.sqlite3")
             database._migrate()
             with database.transaction() as connection:
-                self.assertEqual(connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 1)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 3)
             bad_dir = root / "bad_migrations"
             bad_dir.mkdir()
             (bad_dir / "001_bad.sql").write_text(
@@ -92,6 +92,63 @@ class ApplicationSqliteTests(unittest.TestCase):
                 ).fetchone())
             finally:
                 connection.close()
+
+    def test_marked_migration_rejects_missing_required_table(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "marked-missing.sqlite3"
+            connection = __import__("sqlite3").connect(path)
+            connection.execute(
+                "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)",
+                ("001_initial.sql", "2026-01-01T00:00:00+00:00"),
+            )
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(RuntimeError, "несумісний стан схеми"):
+                SqliteDatabase(path)
+
+    def test_unmarked_migration_rejects_partial_existing_table(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "partial-table.sqlite3"
+            connection = __import__("sqlite3").connect(path)
+            connection.execute("CREATE TABLE import_operations (id TEXT PRIMARY KEY)")
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(RuntimeError, "несумісний стан схеми"):
+                SqliteDatabase(path)
+
+    def test_unmarked_initial_migration_rejects_partial_review_run_table(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "partial-initial.sqlite3"
+            connection = __import__("sqlite3").connect(path)
+            connection.execute("CREATE TABLE review_runs (id TEXT PRIMARY KEY)")
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(RuntimeError, "несумісний стан схеми"):
+                SqliteDatabase(path)
+
+    def test_marked_migration_rejects_missing_diagnostic_column(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "marked-diagnostic.sqlite3"
+            connection = __import__("sqlite3").connect(path)
+            connection.execute("CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)")
+            connection.execute(
+                "INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)",
+                ("003_import_diagnostics.sql", "2026-01-01T00:00:00+00:00"),
+            )
+            connection.execute("""CREATE TABLE import_operations (
+                id TEXT PRIMARY KEY, run_id TEXT, idempotency_key TEXT,
+                source_fingerprint TEXT, final_fingerprint TEXT, status TEXT,
+                selected_sheet TEXT, header_row INTEGER, sheets_json TEXT,
+                created_item_ids_json TEXT, created_at TEXT, updated_at TEXT,
+                expires_at TEXT, confirmed_at TEXT
+            )""")
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(RuntimeError, "несумісний стан схеми"):
+                SqliteDatabase(path)
 
     def test_sqlite_reconstitutes_all_saved_state_machine_statuses(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

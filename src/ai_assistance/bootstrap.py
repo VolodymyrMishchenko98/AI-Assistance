@@ -4,6 +4,7 @@ from .modules.price_checker.infrastructure.persistence.sqlite import (
     SqliteDatabase,
     SqliteUnitOfWork,
 )
+from .modules.price_checker.infrastructure.xlsx_reader import OpenpyxlXlsxReader
 from .presentation.http.server import serve
 
 
@@ -13,6 +14,7 @@ def build_application(settings: Settings | None = None) -> tuple[PriceCheckerApp
     return (
         PriceCheckerApplication(
             lambda: SqliteUnitOfWork(database),
+            OpenpyxlXlsxReader(),
         ),
         database,
     )
