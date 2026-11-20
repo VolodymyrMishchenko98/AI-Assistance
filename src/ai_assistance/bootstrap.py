@@ -15,6 +15,7 @@ def build_application(settings: Settings | None = None) -> tuple[PriceCheckerApp
         PriceCheckerApplication(
             lambda: SqliteUnitOfWork(database),
             OpenpyxlXlsxReader(),
+            write_unit_of_work=lambda: SqliteUnitOfWork(database, immediate=True),
         ),
         database,
     )

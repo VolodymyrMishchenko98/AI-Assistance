@@ -77,7 +77,7 @@ class ApplicationSqliteTests(unittest.TestCase):
             database = SqliteDatabase(root / "test.sqlite3")
             database._migrate()
             with database.transaction() as connection:
-                self.assertEqual(connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 3)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 4)
             bad_dir = root / "bad_migrations"
             bad_dir.mkdir()
             (bad_dir / "001_bad.sql").write_text(

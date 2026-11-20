@@ -1,12 +1,16 @@
 from .commands import (
     AddProcurementItemCommand,
+    CancelReviewRunCommand,
+    CompleteReviewRunCommand,
     ConfirmImportCommand,
     CreateImportPreviewCommand,
     CreateReviewRunCommand,
     ExcludeImportRowCommand,
+    StartReviewRunCommand,
     UpdateImportRowCommand,
 )
 from .dto import ProcurementItemDto, ReviewRunDto
+from .errors import ConcurrencyError
 from .imports import ImportOperationStatus, ImportPreviewDto, ImportRowDto, ImportRowStatus
 from .import_ports import XlsxReader
 from .ports import UnitOfWorkFactory
@@ -16,7 +20,15 @@ import hashlib
 import json
 from pathlib import Path
 from uuid import UUID, uuid4
-from ..domain.models import AuditEvent, ProcurementItem, ReviewRun, ReviewRunStatus, ValidationError
+from ..domain.models import (
+    AuditEvent,
+    InvalidTransitionError,
+    ProcurementItem,
+    ProcurementItemStatus,
+    ReviewRun,
+    ReviewRunStatus,
+    ValidationError,
+)
 
 
 class PriceCheckerApplication:
@@ -24,8 +36,11 @@ class PriceCheckerApplication:
         self,
         unit_of_work: UnitOfWorkFactory,
         xlsx_reader: XlsxReader | None = None,
+        *,
+        write_unit_of_work: UnitOfWorkFactory | None = None,
     ) -> None:
         self._unit_of_work = unit_of_work
+        self._write_unit_of_work = write_unit_of_work or unit_of_work
         self._xlsx_reader = xlsx_reader
 
     def create_review_run(self, command: CreateReviewRunCommand) -> ReviewRunDto:
@@ -81,6 +96,86 @@ class PriceCheckerApplication:
                 ReviewRunDto(run.id, run.status, run.created_at, len(uow.items.list_for_run(run.id)))
                 for run in uow.runs.list()
             ]
+
+    def start_review_run(self, command: StartReviewRunCommand) -> ReviewRunDto:
+        with self._write_unit_of_work() as uow:
+            run = uow.runs.get(command.run_id)
+            if run is None:
+                raise LookupError(f"review run not found: {command.run_id}")
+            if run.status is not ReviewRunStatus.DRAFT:
+                raise InvalidTransitionError(
+                    f"cannot start review run from {run.status.value}"
+                )
+            items = uow.items.list_for_run(command.run_id)
+            if not items:
+                raise ValidationError("cannot start a review run without items")
+            if any(item.status is not ProcurementItemStatus.DRAFT for item in items):
+                raise InvalidTransitionError("all items must be draft before the run starts")
+            run.transition_to(ReviewRunStatus.RUNNING)
+            now = datetime.now(timezone.utc)
+            if not uow.runs.transition_status(
+                command.run_id, ReviewRunStatus.DRAFT, ReviewRunStatus.RUNNING, now
+            ):
+                raise ConcurrencyError("review run changed concurrently")
+            for item in items:
+                item.transition_to(ProcurementItemStatus.PENDING)
+                if not uow.items.update_status(
+                    item.id, ProcurementItemStatus.DRAFT, ProcurementItemStatus.PENDING
+                ):
+                    raise ConcurrencyError("procurement item changed concurrently")
+            uow.audit.append(AuditEvent(
+                "review_run_started",
+                "review_run",
+                command.run_id,
+                {"item_count": len(items)},
+            ))
+            return ReviewRunDto(run.id, run.status, run.created_at, len(items))
+
+    def complete_review_run(self, command: CompleteReviewRunCommand) -> ReviewRunDto:
+        with self._write_unit_of_work() as uow:
+            run = uow.runs.get(command.run_id)
+            if run is None:
+                raise LookupError(f"review run not found: {command.run_id}")
+            if run.status is not ReviewRunStatus.RUNNING:
+                raise InvalidTransitionError(
+                    f"cannot complete review run from {run.status.value}"
+                )
+            items = uow.items.list_for_run(command.run_id)
+            if any(item.status is not ProcurementItemStatus.COMPLETED for item in items):
+                raise ValidationError("all items must be completed before completing the run")
+            run.transition_to(ReviewRunStatus.COMPLETED)
+            now = datetime.now(timezone.utc)
+            if not uow.runs.transition_status(
+                command.run_id, ReviewRunStatus.RUNNING, ReviewRunStatus.COMPLETED, now
+            ):
+                raise ConcurrencyError("review run changed concurrently")
+            uow.audit.append(AuditEvent(
+                "review_run_completed",
+                "review_run",
+                command.run_id,
+                {"item_count": len(items)},
+            ))
+            return ReviewRunDto(run.id, run.status, run.created_at, len(items))
+
+    def cancel_review_run(self, command: CancelReviewRunCommand) -> ReviewRunDto:
+        with self._write_unit_of_work() as uow:
+            run = uow.runs.get(command.run_id)
+            if run is None:
+                raise LookupError(f"review run not found: {command.run_id}")
+            previous = run.status
+            run.transition_to(ReviewRunStatus.CANCELLED)
+            now = datetime.now(timezone.utc)
+            if not uow.runs.transition_status(
+                command.run_id, previous, ReviewRunStatus.CANCELLED, now
+            ):
+                raise ConcurrencyError("review run changed concurrently")
+            uow.audit.append(AuditEvent(
+                "review_run_cancelled",
+                "review_run",
+                command.run_id,
+                {"previous_status": previous.value},
+            ))
+            return ReviewRunDto(run.id, run.status, run.created_at, len(uow.items.list_for_run(command.run_id)))
 
     def create_import_preview(self, command: CreateImportPreviewCommand) -> ImportPreviewDto:
         try:

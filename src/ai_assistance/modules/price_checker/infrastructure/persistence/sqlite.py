@@ -9,6 +9,7 @@ from typing import Iterator
 from uuid import UUID
 from typing import Any
 
+from ...application.errors import ConcurrencyError
 from ...application.ports import PriceCheckerUnitOfWork
 from ...application.imports import (
     ImportOperationStatus,
@@ -30,6 +31,19 @@ from ...domain.models import (
 
 def _dt(value: str) -> datetime:
     return datetime.fromisoformat(value)
+
+
+_SQLITE_BUSY = getattr(sqlite3, "SQLITE_BUSY", 5)
+_SQLITE_LOCKED = getattr(sqlite3, "SQLITE_LOCKED", 6)
+
+
+def _is_lock_contention(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.Error):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if not isinstance(code, int):
+        return False
+    return (code & 0xFF) in (_SQLITE_BUSY, _SQLITE_LOCKED)
 
 
 def _json_value(value: Any) -> Any:
@@ -106,6 +120,8 @@ class SqliteDatabase:
                                         "import_preview_rows": required_columns["import_preview_rows"]})
                     elif migration.name == "003_import_diagnostics.sql":
                         require_tables({"import_operations": required_columns["import_operations"] | {"diagnostic"}})
+                    elif migration.name == "004_item_soft_delete.sql":
+                        require_tables({"procurement_items": required_columns["procurement_items"] | {"deleted_at"}})
                     continue
 
                 if migration.name == "002_import_staging.sql":
@@ -126,6 +142,11 @@ class SqliteDatabase:
                         raise RuntimeError("несумісний стан схеми: відсутня таблиця import_operations")
                     if "diagnostic" in table_columns("import_operations"):
                         raise RuntimeError("несумісний стан схеми: diagnostic вже існує, але миграція 003 не позначена")
+                elif migration.name == "004_item_soft_delete.sql":
+                    if not table_exists("procurement_items"):
+                        raise RuntimeError("несумісний стан схеми: відсутня таблиця procurement_items")
+                    if "deleted_at" in table_columns("procurement_items"):
+                        raise RuntimeError("несумісний стан схеми: deleted_at вже існує, але миграція 004 не позначена")
                 try:
                     connection.execute("BEGIN")
                     statement = ""
@@ -148,14 +169,16 @@ class SqliteDatabase:
             connection.close()
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection = self._connect()
         try:
-            connection.execute("BEGIN")
+            connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             yield connection
             connection.commit()
-        except Exception:
+        except Exception as exc:
             connection.rollback()
+            if isinstance(exc, sqlite3.OperationalError) and _is_lock_contention(exc):
+                raise ConcurrencyError("database is busy") from exc
             raise
         finally:
             connection.close()
@@ -197,6 +220,19 @@ class _RunRepository:
         rows = self.db.execute("SELECT id FROM review_runs ORDER BY created_at DESC").fetchall()
         return [run for row in rows if (run := self.get(UUID(row["id"]))) is not None]
 
+    def transition_status(
+        self,
+        run_id: UUID,
+        expected: ReviewRunStatus,
+        target: ReviewRunStatus,
+        now: datetime,
+    ) -> bool:
+        cursor = self.db.execute(
+            "UPDATE review_runs SET status=?, updated_at=? WHERE id=? AND status=?",
+            (target.value, now.isoformat(), str(run_id), expected.value),
+        )
+        return cursor.rowcount == 1
+
 
 class _ItemRepository:
     def __init__(self, database: SqliteDatabase) -> None:
@@ -214,25 +250,74 @@ class _ItemRepository:
             ),
         )
 
+    def get(self, run_id: UUID, item_id: UUID) -> ProcurementItem | None:
+        row = self.db.execute(
+            "SELECT * FROM procurement_items WHERE id = ? AND run_id = ? AND deleted_at IS NULL",
+            (str(item_id), str(run_id)),
+        ).fetchone()
+        return self._row(row) if row is not None else None
+
     def list_for_run(self, run_id: UUID) -> list[ProcurementItem]:
         rows = self.db.execute(
-            "SELECT * FROM procurement_items WHERE run_id = ? ORDER BY created_at", (str(run_id),)
+            "SELECT * FROM procurement_items WHERE run_id = ? AND deleted_at IS NULL ORDER BY created_at",
+            (str(run_id),),
         ).fetchall()
-        restored = []
-        for row in rows:
-            try:
-                status = ProcurementItemStatus(row["status"])
-            except ValueError as exc:
-                raise ValidationError("stored procurement item has an unknown status") from exc
-            restored.append(
-                ProcurementItem._reconstitute(
-                    id=UUID(row["id"]), run_id=UUID(row["run_id"]), name=row["name"],
-                    description=row["description"],
-                    quantity=Decimal(row["quantity"]) if row["quantity"] is not None else None,
-                    unit=row["unit"], status=status, created_at=_dt(row["created_at"]),
-                )
-            )
-        return restored
+        return [self._row(row) for row in rows]
+
+    @staticmethod
+    def _row(row: sqlite3.Row) -> ProcurementItem:
+        try:
+            status = ProcurementItemStatus(row["status"])
+        except ValueError as exc:
+            raise ValidationError("stored procurement item has an unknown status") from exc
+        return ProcurementItem._reconstitute(
+            id=UUID(row["id"]), run_id=UUID(row["run_id"]), name=row["name"],
+            description=row["description"],
+            quantity=Decimal(row["quantity"]) if row["quantity"] is not None else None,
+            unit=row["unit"], status=status, created_at=_dt(row["created_at"]),
+        )
+
+    def update_fields(self, item: ProcurementItem) -> bool:
+        if item.run_id is None:
+            return False
+        cursor = self.db.execute(
+            """UPDATE procurement_items
+            SET name=?, description=?, quantity=?, unit=?
+            WHERE id=? AND run_id=? AND status=? AND deleted_at IS NULL""",
+            (
+                item.name, item.description,
+                str(item.quantity) if item.quantity is not None else None, item.unit,
+                str(item.id), str(item.run_id), ProcurementItemStatus.DRAFT.value,
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def update_status(
+        self,
+        item_id: UUID,
+        expected: ProcurementItemStatus,
+        target: ProcurementItemStatus,
+    ) -> bool:
+        cursor = self.db.execute(
+            "UPDATE procurement_items SET status=? WHERE id=? AND status=?",
+            (target.value, str(item_id), expected.value),
+        )
+        return cursor.rowcount == 1
+
+    def soft_delete(self, run_id: UUID, item_id: UUID, expected: ProcurementItemStatus) -> bool:
+        if expected is not ProcurementItemStatus.DRAFT:
+            return False
+        cursor = self.db.execute(
+            """UPDATE procurement_items SET deleted_at=?
+            WHERE id=? AND run_id=? AND status=? AND deleted_at IS NULL""",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                str(item_id),
+                str(run_id),
+                ProcurementItemStatus.DRAFT.value,
+            ),
+        )
+        return cursor.rowcount == 1
 
 
 class _AuditRepository:
@@ -390,12 +475,13 @@ class _ImportRepository:
 
 
 class SqliteUnitOfWork(PriceCheckerUnitOfWork):
-    def __init__(self, database: SqliteDatabase) -> None:
+    def __init__(self, database: SqliteDatabase, *, immediate: bool = False) -> None:
         self.database = database
+        self.immediate = immediate
         self._transaction = None
 
     def __enter__(self) -> "SqliteUnitOfWork":
-        self._transaction = self.database.transaction()
+        self._transaction = self.database.transaction(immediate=self.immediate)
         connection = self._transaction.__enter__()
         self.runs = _RunRepository(connection)
         self.items = _ItemRepository(connection)

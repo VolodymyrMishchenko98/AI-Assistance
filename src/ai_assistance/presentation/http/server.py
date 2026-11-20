@@ -18,8 +18,9 @@ from ...modules.price_checker.application.commands import (
     ExcludeImportRowCommand,
     UpdateImportRowCommand,
 )
+from ...modules.price_checker.application.errors import ConcurrencyError
 from ...modules.price_checker.application.services import PriceCheckerApplication
-from ...modules.price_checker.domain.models import ValidationError
+from ...modules.price_checker.domain.models import InvalidTransitionError, ValidationError
 
 
 class LocalRequestHandler(BaseHTTPRequestHandler):
@@ -113,6 +114,8 @@ class LocalRequestHandler(BaseHTTPRequestHandler):
             self._send_body(200, body)
         except LookupError:
             self._send_error(404, "Перевірку не знайдено")
+        except (InvalidTransitionError, ConcurrencyError):
+            self._send_error(409, "Операція конфліктує з іншою зміною")
         except (ValueError, ValidationError):
             self._send_error(400, "Некоректні дані запиту")
         except Exception:
@@ -229,6 +232,8 @@ class LocalRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
         except LookupError:
             self._send_error(404, "Перевірку не знайдено")
+        except (InvalidTransitionError, ConcurrencyError):
+            self._send_error(409, "Операція конфліктує з іншою зміною")
         except (UnicodeDecodeError, ValueError, ValidationError):
             self._send_error(400, "Некоректні дані запиту")
         except Exception:

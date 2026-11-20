@@ -9,6 +9,21 @@ class CreateReviewRunCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class StartReviewRunCommand:
+    run_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class CompleteReviewRunCommand:
+    run_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class CancelReviewRunCommand:
+    run_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
 class AddProcurementItemCommand:
     run_id: UUID
     name: str
