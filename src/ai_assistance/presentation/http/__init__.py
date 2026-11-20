@@ -1,0 +1,2 @@
+"""Local HTTP presentation adapter."""
+

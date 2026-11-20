@@ -1,0 +1,2 @@
+"""Price Checker business module."""
+
