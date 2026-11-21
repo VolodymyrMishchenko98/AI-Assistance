@@ -15,6 +15,7 @@ from .errors import ConcurrencyError
 from .imports import ImportOperationStatus, ImportPreviewDto, ImportRowDto, ImportRowStatus
 from .import_ports import XlsxReader
 from .ports import UnitOfWorkFactory
+from .search_ports import SearchProvider
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -39,10 +40,12 @@ class PriceCheckerApplication:
         xlsx_reader: XlsxReader | None = None,
         *,
         write_unit_of_work: UnitOfWorkFactory | None = None,
+        search_provider: SearchProvider | None = None,
     ) -> None:
         self._unit_of_work = unit_of_work
         self._write_unit_of_work = write_unit_of_work or unit_of_work
         self._xlsx_reader = xlsx_reader
+        self._search_provider = search_provider
 
     def create_review_run(self, command: CreateReviewRunCommand) -> ReviewRunDto:
         with self._unit_of_work() as uow:
