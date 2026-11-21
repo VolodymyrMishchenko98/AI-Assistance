@@ -1,11 +1,17 @@
+import http.client
+import json
+import re
 import sqlite3
 import threading
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
 
 from src.ai_assistance.modules.price_checker.application.commands import (
@@ -13,6 +19,7 @@ from src.ai_assistance.modules.price_checker.application.commands import (
     CancelReviewRunCommand,
     CompleteReviewRunCommand,
     CreateReviewRunCommand,
+    SetProcurementItemStatusCommand,
     StartReviewRunCommand,
 )
 from src.ai_assistance.modules.price_checker.application.errors import ConcurrencyError
@@ -30,6 +37,7 @@ from src.ai_assistance.modules.price_checker.infrastructure.persistence.sqlite i
     SqliteUnitOfWork,
     _is_lock_contention,
 )
+from src.ai_assistance.presentation.http.server import LocalRequestHandler
 
 
 class _FakeConnection:
@@ -865,6 +873,791 @@ class StageB3Step2LockTests(unittest.TestCase):
                 pass
         self.assertIs(context.exception, error)
         self.assertNotIsInstance(context.exception, ConcurrencyError)
+
+
+class StageB3Step3Tests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.db = SqliteDatabase(self.root / "step3-app.sqlite3")
+
+    def tearDown(self) -> None:
+        self.db.close()
+        self.tmp.cleanup()
+
+    def _app(self, write=None) -> PriceCheckerApplication:
+        factory = write or (lambda: SqliteUnitOfWork(self.db, immediate=True))
+        return PriceCheckerApplication(
+            lambda: SqliteUnitOfWork(self.db),
+            write_unit_of_work=factory,
+        )
+
+    def _run_with_items(self, count: int = 2):
+        app = self._app()
+        run = app.create_review_run(CreateReviewRunCommand())
+        items = [
+            app.add_procurement_item(AddProcurementItemCommand(
+                run.id, f"item-{index}", quantity=Decimal("1"), unit="шт."
+            ))
+            for index in range(count)
+        ]
+        return app, run, items
+
+    def _start(self, app, run):
+        app.start_review_run(StartReviewRunCommand(run.id))
+        return app.list_procurement_items(run.id)
+
+    def _set(self, app, run, item, status):
+        return app.set_procurement_item_status(
+            SetProcurementItemStatusCommand(run.id, item.id, status)
+        )
+
+    def _item_row(self, item_id):
+        with self.db.transaction() as connection:
+            return connection.execute(
+                "SELECT status FROM procurement_items WHERE id = ?", (str(item_id),)
+            ).fetchone()
+
+    def _audit(self):
+        with self.db.transaction() as connection:
+            return connection.execute(
+                "SELECT event_type, data_json FROM audit_events ORDER BY occurred_at, id"
+            ).fetchall()
+
+    def _audit_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for row in self._audit():
+            counts[row["event_type"]] = counts.get(row["event_type"], 0) + 1
+        return counts
+
+    # ------------------------------------------------------------------
+    # item status transitions
+    # ------------------------------------------------------------------
+
+    def test_complete_item_transitions_pending_to_completed(self) -> None:
+        app, run, items = self._run_with_items(1)
+        self._start(app, run)
+        result = self._set(app, run, items[0], ProcurementItemStatus.COMPLETED)
+        self.assertEqual(result.status, ProcurementItemStatus.COMPLETED)
+        self.assertEqual(self._item_row(items[0].id)["status"], ProcurementItemStatus.COMPLETED.value)
+        self.assertEqual(self._audit_counts().get("procurement_item_completed"), 1)
+
+    def test_fail_item_transitions_pending_to_failed(self) -> None:
+        app, run, items = self._run_with_items(1)
+        self._start(app, run)
+        result = self._set(app, run, items[0], ProcurementItemStatus.FAILED)
+        self.assertEqual(result.status, ProcurementItemStatus.FAILED)
+        self.assertEqual(self._item_row(items[0].id)["status"], ProcurementItemStatus.FAILED.value)
+        self.assertEqual(self._audit_counts().get("procurement_item_failed"), 1)
+
+    def test_retry_failed_item_transitions_back_to_pending(self) -> None:
+        app, run, items = self._run_with_items(1)
+        self._start(app, run)
+        self._set(app, run, items[0], ProcurementItemStatus.FAILED)
+        result = self._set(app, run, items[0], ProcurementItemStatus.PENDING)
+        self.assertEqual(result.status, ProcurementItemStatus.PENDING)
+        self.assertEqual(self._item_row(items[0].id)["status"], ProcurementItemStatus.PENDING.value)
+        counts = self._audit_counts()
+        self.assertEqual(counts.get("procurement_item_failed"), 1)
+        self.assertEqual(counts.get("procurement_item_retried"), 1)
+
+    def test_completed_item_cannot_be_reopened(self) -> None:
+        app, run, items = self._run_with_items(1)
+        self._start(app, run)
+        self._set(app, run, items[0], ProcurementItemStatus.COMPLETED)
+        baseline = self._audit_counts()
+        with self.assertRaises(InvalidTransitionError):
+            self._set(app, run, items[0], ProcurementItemStatus.PENDING)
+        self.assertEqual(self._item_row(items[0].id)["status"], ProcurementItemStatus.COMPLETED.value)
+        self.assertEqual(self._audit_counts(), baseline)
+
+    def test_failed_item_cannot_be_completed_directly(self) -> None:
+        app, run, items = self._run_with_items(1)
+        self._start(app, run)
+        self._set(app, run, items[0], ProcurementItemStatus.FAILED)
+        baseline = self._audit_counts()
+        with self.assertRaises(InvalidTransitionError):
+            self._set(app, run, items[0], ProcurementItemStatus.COMPLETED)
+        self.assertEqual(self._item_row(items[0].id)["status"], ProcurementItemStatus.FAILED.value)
+        self.assertEqual(self._audit_counts(), baseline)
+
+    def test_pending_item_cannot_be_retried(self) -> None:
+        app, run, items = self._run_with_items(1)
+        self._start(app, run)
+        baseline = self._audit_counts()
+        with self.assertRaises(InvalidTransitionError):
+            self._set(app, run, items[0], ProcurementItemStatus.PENDING)
+        self.assertEqual(self._item_row(items[0].id)["status"], ProcurementItemStatus.PENDING.value)
+        self.assertEqual(self._audit_counts(), baseline)
+
+    def test_item_status_change_does_not_touch_other_items(self) -> None:
+        app, run, items = self._run_with_items(2)
+        self._start(app, run)
+        self._set(app, run, items[0], ProcurementItemStatus.COMPLETED)
+        self.assertEqual(self._item_row(items[1].id)["status"], ProcurementItemStatus.PENDING.value)
+
+    # ------------------------------------------------------------------
+    # guards
+    # ------------------------------------------------------------------
+
+    def test_item_status_change_requires_running_run(self) -> None:
+        app, run, items = self._run_with_items(1)
+        baseline = self._audit_counts()
+        with self.assertRaises(InvalidTransitionError):
+            self._set(app, run, items[0], ProcurementItemStatus.COMPLETED)
+        self.assertEqual(self._item_row(items[0].id)["status"], ProcurementItemStatus.DRAFT.value)
+        self.assertEqual(self._audit_counts(), baseline)
+
+    def test_item_status_change_rejects_missing_item(self) -> None:
+        app, run, _ = self._run_with_items(1)
+        self._start(app, run)
+        with self.assertRaises(LookupError):
+            self._set(app, run, SimpleNamespace(id=uuid4()), ProcurementItemStatus.COMPLETED)
+
+    def test_item_status_change_rejects_item_from_another_run(self) -> None:
+        app = self._app()
+        first = app.create_review_run(CreateReviewRunCommand())
+        second = app.create_review_run(CreateReviewRunCommand())
+        foreign = app.add_procurement_item(AddProcurementItemCommand(
+            second.id, "foreign", quantity=Decimal("1"), unit="шт."
+        ))
+        own = app.add_procurement_item(AddProcurementItemCommand(
+            first.id, "own", quantity=Decimal("1"), unit="шт."
+        ))
+        app.start_review_run(StartReviewRunCommand(first.id))
+        with self.assertRaises(LookupError):
+            self._set(app, first, foreign, ProcurementItemStatus.COMPLETED)
+        self.assertEqual(self._item_row(own.id)["status"], ProcurementItemStatus.PENDING.value)
+        self.assertEqual(self._item_row(foreign.id)["status"], ProcurementItemStatus.DRAFT.value)
+
+    def test_item_status_change_rejects_soft_deleted_item(self) -> None:
+        app, run, items = self._run_with_items(2)
+        with SqliteUnitOfWork(self.db, immediate=True) as uow:
+            self.assertTrue(uow.items.soft_delete(
+                run.id, items[0].id, ProcurementItemStatus.DRAFT
+            ))
+        self._start(app, run)
+        with self.assertRaises(LookupError):
+            self._set(app, run, items[0], ProcurementItemStatus.COMPLETED)
+        self.assertEqual(self._item_row(items[1].id)["status"], ProcurementItemStatus.PENDING.value)
+
+    def test_item_status_change_rejects_terminal_run(self) -> None:
+        app, run, items = self._run_with_items(1)
+        self._start(app, run)
+        self._set(app, run, items[0], ProcurementItemStatus.COMPLETED)
+        app.complete_review_run(CompleteReviewRunCommand(run.id))
+        baseline = self._audit_counts()
+        with self.assertRaises(InvalidTransitionError):
+            self._set(app, run, items[0], ProcurementItemStatus.FAILED)
+        self.assertEqual(self._audit_counts(), baseline)
+
+    # ------------------------------------------------------------------
+    # audit payload and transactions
+    # ------------------------------------------------------------------
+
+    def test_audit_payload_uses_enum_value_strings(self) -> None:
+        app, run, items = self._run_with_items(1)
+        self._start(app, run)
+        self._set(app, run, items[0], ProcurementItemStatus.COMPLETED)
+        rows = [row for row in self._audit() if row["event_type"] == "procurement_item_completed"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            json.loads(rows[0]["data_json"]),
+            {
+                "run_id": str(run.id),
+                "item_id": str(items[0].id),
+                "from_status": "pending",
+                "to_status": "completed",
+            },
+        )
+
+    def test_audit_failure_rolls_back_item_status(self) -> None:
+        class FailingAudit:
+            def append(self, event):
+                raise RuntimeError("audit unavailable")
+
+        class FailingUow(SqliteUnitOfWork):
+            def __enter__(self):
+                result = super().__enter__()
+                result.audit = FailingAudit()
+                return result
+
+        app, run, items = self._run_with_items(1)
+        self._start(app, run)
+        failing_app = PriceCheckerApplication(
+            lambda: SqliteUnitOfWork(self.db),
+            write_unit_of_work=lambda: FailingUow(self.db, immediate=True),
+        )
+        baseline = self._audit_counts()
+        with self.assertRaises(RuntimeError):
+            failing_app.set_procurement_item_status(SetProcurementItemStatusCommand(
+                run.id, items[0].id, ProcurementItemStatus.COMPLETED
+            ))
+        self.assertEqual(self._item_row(items[0].id)["status"], ProcurementItemStatus.PENDING.value)
+        self.assertEqual(self._audit_counts(), baseline)
+
+    def test_stale_item_status_raises_concurrency_error(self) -> None:
+        class FailingItemStatusUow(SqliteUnitOfWork):
+            def __enter__(self):
+                result = super().__enter__()
+                result.items.update_status = lambda *args, **kwargs: False
+                return result
+
+        app, run, items = self._run_with_items(1)
+        self._start(app, run)
+        stale_app = PriceCheckerApplication(
+            lambda: SqliteUnitOfWork(self.db),
+            write_unit_of_work=lambda: FailingItemStatusUow(self.db, immediate=True),
+        )
+        baseline = self._audit_counts()
+        with self.assertRaises(ConcurrencyError):
+            stale_app.set_procurement_item_status(SetProcurementItemStatusCommand(
+                run.id, items[0].id, ProcurementItemStatus.COMPLETED
+            ))
+        self.assertEqual(self._item_row(items[0].id)["status"], ProcurementItemStatus.PENDING.value)
+        self.assertEqual(self._audit_counts(), baseline)
+
+    def test_domain_transition_precedes_persistence(self) -> None:
+        app, run, items = self._run_with_items(1)
+        self._start(app, run)
+        order: list[str] = []
+        original_transition = ProcurementItem.transition_to
+
+        def spy_transition(self, status):
+            order.append("domain")
+            return original_transition(self, status)
+
+        class RecordingUow(SqliteUnitOfWork):
+            def __enter__(self):
+                result = super().__enter__()
+                original = result.items.update_status
+
+                def wrapped(*args, **kwargs):
+                    order.append("persist")
+                    return original(*args, **kwargs)
+
+                result.items.update_status = wrapped
+                return result
+
+        recording_app = PriceCheckerApplication(
+            lambda: SqliteUnitOfWork(self.db),
+            write_unit_of_work=lambda: RecordingUow(self.db, immediate=True),
+        )
+        with patch.object(ProcurementItem, "transition_to", spy_transition):
+            recording_app.set_procurement_item_status(SetProcurementItemStatusCommand(
+                run.id, items[0].id, ProcurementItemStatus.COMPLETED
+            ))
+        self.assertEqual(order[:2], ["domain", "persist"])
+
+    def test_item_status_change_writes_single_audit_event(self) -> None:
+        app, run, items = self._run_with_items(1)
+        self._start(app, run)
+        before = len(self._audit())
+        self._set(app, run, items[0], ProcurementItemStatus.FAILED)
+        after = self._audit()
+        self.assertEqual(len(after), before + 1)
+        self.assertEqual(after[-1]["event_type"], "procurement_item_failed")
+
+    def test_item_status_change_uses_write_unit_of_work(self) -> None:
+        seen: list[bool] = []
+
+        class RecordingUow(SqliteUnitOfWork):
+            def __enter__(self):
+                seen.append(self.immediate)
+                return super().__enter__()
+
+        app, run, items = self._run_with_items(1)
+        self._start(app, run)
+        recording_app = PriceCheckerApplication(
+            lambda: SqliteUnitOfWork(self.db),
+            write_unit_of_work=lambda: RecordingUow(self.db, immediate=True),
+        )
+        recording_app.set_procurement_item_status(SetProcurementItemStatusCommand(
+            run.id, items[0].id, ProcurementItemStatus.COMPLETED
+        ))
+        self.assertTrue(seen)
+        self.assertTrue(all(seen))
+
+
+class StageB3Step3HttpTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.db = SqliteDatabase(self.root / "step3-http.sqlite3")
+        self.app = PriceCheckerApplication(
+            lambda: SqliteUnitOfWork(self.db),
+            write_unit_of_work=lambda: SqliteUnitOfWork(self.db, immediate=True),
+        )
+        self.server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            type("Handler", (LocalRequestHandler,), {"application": self.app}),
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=3)
+        self.db.close()
+        self.tmp.cleanup()
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    def _request(self, method, path, *, cookie=None, body=None, content_type=None,
+                 origin=None, host=None):
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=10
+        )
+        headers = {}
+        if cookie is not None:
+            headers["Cookie"] = cookie
+        if content_type is not None:
+            headers["Content-Type"] = content_type
+        if origin is not None:
+            headers["Origin"] = origin
+        if host is not None:
+            headers["Host"] = host
+        if body is not None:
+            headers["Content-Length"] = str(len(body))
+        try:
+            connection.request(method, path, body=body, headers=headers)
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            connection.close()
+
+    def _post(self, path, data, cookie, token, *, origin=None, host=None,
+              include_csrf=True, csrf=None):
+        payload = {key: str(value) for key, value in data.items()}
+        if include_csrf:
+            payload["csrf_token"] = token if csrf is None else csrf
+        body = urlencode(payload).encode("utf-8")
+        return self._request(
+            "POST", path, cookie=cookie, body=body,
+            content_type="application/x-www-form-urlencoded",
+            origin=self.base if origin is None else origin, host=host,
+        )
+
+    def _session(self):
+        status, headers, body = self._request("GET", "/")
+        self.assertEqual(status, 200)
+        cookie = headers["Set-Cookie"].split(";")[0]
+        token = re.search(r'name="csrf_token" value="([^"]+)"', body.decode("utf-8")).group(1)
+        return cookie, token
+
+    def _create_run(self, cookie, token):
+        before = {run.id for run in self.app.dashboard()}
+        status, _, _ = self._post("/runs", {}, cookie, token)
+        self.assertEqual(status, 303)
+        created = [run.id for run in self.app.dashboard() if run.id not in before]
+        self.assertEqual(len(created), 1)
+        return created[0]
+
+    def _add_item(self, run_id, cookie, token, name="позиція"):
+        status, _, _ = self._post(
+            f"/runs/{run_id}/items",
+            {"name": name, "quantity": "1", "unit": "шт.", "description": ""},
+            cookie, token,
+        )
+        self.assertEqual(status, 303)
+        return self.app.list_procurement_items(run_id)[-1]
+
+    def _page(self, run_id):
+        status, _, body = self._request("GET", f"/runs/{run_id}")
+        self.assertEqual(status, 200)
+        return body.decode("utf-8")
+
+    def _run_status(self, run_id):
+        with self.db.transaction() as connection:
+            row = connection.execute(
+                "SELECT status FROM review_runs WHERE id = ?", (str(run_id),)
+            ).fetchone()
+        return ReviewRunStatus(row["status"])
+
+    def _item_status(self, item_id):
+        with self.db.transaction() as connection:
+            row = connection.execute(
+                "SELECT status FROM procurement_items WHERE id = ?", (str(item_id),)
+            ).fetchone()
+        return ProcurementItemStatus(row["status"])
+
+    def _audit_counts(self) -> dict[str, int]:
+        with self.db.transaction() as connection:
+            rows = connection.execute(
+                "SELECT event_type, COUNT(*) AS c FROM audit_events GROUP BY event_type"
+            ).fetchall()
+        return {row["event_type"]: row["c"] for row in rows}
+
+    # ------------------------------------------------------------------
+    # rendering
+    # ------------------------------------------------------------------
+
+    def test_run_page_shows_status_and_only_valid_actions(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        item = self._add_item(run_id, cookie, token)
+        draft = self._page(run_id)
+        self.assertIn("Статус: Чернетка", draft)
+        self.assertIn("Почати перевірку", draft)
+        self.assertIn("Скасувати перевірку", draft)
+        self.assertNotIn("Завершити перевірку", draft)
+        self.assertIn("Додати закупівельну позицію", draft)
+        self.assertIn("Імпорт XLSX", draft)
+
+        self.assertEqual(self._post(f"/runs/{run_id}/start", {}, cookie, token)[0], 303)
+        running = self._page(run_id)
+        self.assertIn("Статус: Виконується", running)
+        self.assertIn("Завершити перевірку", running)
+        self.assertIn("Позначити виконаною", running)
+        self.assertIn("Позначити помилкою", running)
+        self.assertNotIn("Почати перевірку", running)
+        self.assertNotIn("Додати закупівельну позицію", running)
+        self.assertNotIn("Імпорт XLSX", running)
+
+        self.assertEqual(
+            self._post(f"/runs/{run_id}/items/{item.id}/complete", {}, cookie, token)[0], 303
+        )
+        after_item = self._page(run_id)
+        self.assertNotIn("Позначити виконаною", after_item)
+        self.assertNotIn("Позначити помилкою", after_item)
+
+        self.assertEqual(self._post(f"/runs/{run_id}/complete", {}, cookie, token)[0], 303)
+        completed = self._page(run_id)
+        self.assertIn("Статус: Завершено", completed)
+        self.assertNotIn("Завершити перевірку", completed)
+        self.assertNotIn("Скасувати перевірку", completed)
+        self.assertNotIn("Повторити", completed)
+
+    def test_empty_run_page_explains_start_requirement(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        page = self._page(run_id)
+        self.assertIn("додайте хоча б одну активну позицію", page)
+        self.assertIn("<button disabled>Почати перевірку</button>", page)
+
+    def test_each_rendered_form_has_exactly_one_csrf_token(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        self._add_item(run_id, cookie, token)
+        for page in (self._page(run_id),):
+            forms = re.findall(r"<form\b.*?</form>", page, re.DOTALL)
+            self.assertGreaterEqual(len(forms), 3)
+            for form in forms:
+                self.assertEqual(form.count('name="csrf_token"'), 1)
+
+        self.assertEqual(self._post(f"/runs/{run_id}/start", {}, cookie, token)[0], 303)
+        forms = re.findall(r"<form\b.*?</form>", self._page(run_id), re.DOTALL)
+        self.assertGreaterEqual(len(forms), 2)
+        for form in forms:
+            self.assertEqual(form.count('name="csrf_token"'), 1)
+
+    # ------------------------------------------------------------------
+    # lifecycle actions
+    # ------------------------------------------------------------------
+
+    def test_start_transitions_all_active_items_atomically(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        first = self._add_item(run_id, cookie, token, "перша")
+        second = self._add_item(run_id, cookie, token, "друга")
+        self.assertEqual(self._post(f"/runs/{run_id}/start", {}, cookie, token)[0], 303)
+        self.assertEqual(self._run_status(run_id), ReviewRunStatus.RUNNING)
+        self.assertEqual(self._item_status(first.id), ProcurementItemStatus.PENDING)
+        self.assertEqual(self._item_status(second.id), ProcurementItemStatus.PENDING)
+        self.assertEqual(self._audit_counts().get("review_run_started"), 1)
+
+    def test_start_without_items_is_rejected(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        baseline = self._audit_counts()
+        self.assertEqual(self._post(f"/runs/{run_id}/start", {}, cookie, token)[0], 400)
+        self.assertEqual(self._run_status(run_id), ReviewRunStatus.DRAFT)
+        self.assertEqual(self._audit_counts(), baseline)
+
+    def test_item_complete_fail_and_retry_via_http(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        first = self._add_item(run_id, cookie, token, "перша")
+        second = self._add_item(run_id, cookie, token, "друга")
+        self.assertEqual(self._post(f"/runs/{run_id}/start", {}, cookie, token)[0], 303)
+
+        self.assertEqual(
+            self._post(f"/runs/{run_id}/items/{first.id}/complete", {}, cookie, token)[0], 303
+        )
+        self.assertEqual(self._item_status(first.id), ProcurementItemStatus.COMPLETED)
+
+        self.assertEqual(
+            self._post(f"/runs/{run_id}/items/{second.id}/fail", {}, cookie, token)[0], 303
+        )
+        self.assertEqual(self._item_status(second.id), ProcurementItemStatus.FAILED)
+        failed_page = self._page(run_id)
+        self.assertIn("Повторити", failed_page)
+        self.assertNotIn("Позначити виконаною", failed_page)
+        self.assertNotIn("Позначити помилкою", failed_page)
+
+        self.assertEqual(
+            self._post(f"/runs/{run_id}/items/{second.id}/retry", {}, cookie, token)[0], 303
+        )
+        self.assertEqual(self._item_status(second.id), ProcurementItemStatus.PENDING)
+        retried_page = self._page(run_id)
+        self.assertIn("Позначити виконаною", retried_page)
+        self.assertNotIn("Повторити", retried_page)
+
+        counts = self._audit_counts()
+        self.assertEqual(counts.get("procurement_item_completed"), 1)
+        self.assertEqual(counts.get("procurement_item_failed"), 1)
+        self.assertEqual(counts.get("procurement_item_retried"), 1)
+
+    def test_complete_run_requires_all_items_completed(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        first = self._add_item(run_id, cookie, token, "перша")
+        second = self._add_item(run_id, cookie, token, "друга")
+        self.assertEqual(self._post(f"/runs/{run_id}/start", {}, cookie, token)[0], 303)
+        self.assertEqual(
+            self._post(f"/runs/{run_id}/items/{first.id}/complete", {}, cookie, token)[0], 303
+        )
+        self.assertEqual(self._post(f"/runs/{run_id}/complete", {}, cookie, token)[0], 400)
+        self.assertEqual(self._run_status(run_id), ReviewRunStatus.RUNNING)
+
+        self.assertEqual(
+            self._post(f"/runs/{run_id}/items/{second.id}/complete", {}, cookie, token)[0], 303
+        )
+        self.assertEqual(self._post(f"/runs/{run_id}/complete", {}, cookie, token)[0], 303)
+        self.assertEqual(self._run_status(run_id), ReviewRunStatus.COMPLETED)
+        self.assertEqual(self._audit_counts().get("review_run_completed"), 1)
+
+    def test_cancel_draft_run(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        item = self._add_item(run_id, cookie, token)
+        self.assertEqual(self._post(f"/runs/{run_id}/cancel", {}, cookie, token)[0], 303)
+        self.assertEqual(self._run_status(run_id), ReviewRunStatus.CANCELLED)
+        self.assertEqual(self._item_status(item.id), ProcurementItemStatus.DRAFT)
+        self.assertEqual(self._audit_counts().get("review_run_cancelled"), 1)
+
+    def test_cancel_running_run_keeps_item_statuses(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        item = self._add_item(run_id, cookie, token)
+        self.assertEqual(self._post(f"/runs/{run_id}/start", {}, cookie, token)[0], 303)
+        self.assertEqual(self._post(f"/runs/{run_id}/cancel", {}, cookie, token)[0], 303)
+        self.assertEqual(self._run_status(run_id), ReviewRunStatus.CANCELLED)
+        self.assertEqual(self._item_status(item.id), ProcurementItemStatus.PENDING)
+
+    def test_complete_run_ignores_soft_deleted_items(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        removed = self._add_item(run_id, cookie, token, "видалити")
+        kept = self._add_item(run_id, cookie, token, "залишити")
+        with SqliteUnitOfWork(self.db, immediate=True) as uow:
+            self.assertTrue(uow.items.soft_delete(
+                run_id, removed.id, ProcurementItemStatus.DRAFT
+            ))
+        self.assertEqual(self._post(f"/runs/{run_id}/start", {}, cookie, token)[0], 303)
+        self.assertEqual(self._item_status(kept.id), ProcurementItemStatus.PENDING)
+        self.assertEqual(
+            self._post(f"/runs/{run_id}/items/{kept.id}/complete", {}, cookie, token)[0], 303
+        )
+        self.assertEqual(self._post(f"/runs/{run_id}/complete", {}, cookie, token)[0], 303)
+        self.assertEqual(self._run_status(run_id), ReviewRunStatus.COMPLETED)
+
+    def test_invalid_transitions_return_409(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        item = self._add_item(run_id, cookie, token)
+        self.assertEqual(self._post(f"/runs/{run_id}/complete", {}, cookie, token)[0], 409)
+        self.assertEqual(self._post(f"/runs/{run_id}/start", {}, cookie, token)[0], 303)
+        self.assertEqual(self._post(f"/runs/{run_id}/start", {}, cookie, token)[0], 409)
+        self.assertEqual(
+            self._post(f"/runs/{run_id}/items/{item.id}/complete", {}, cookie, token)[0], 303
+        )
+        self.assertEqual(self._post(f"/runs/{run_id}/complete", {}, cookie, token)[0], 303)
+        self.assertEqual(self._post(f"/runs/{run_id}/cancel", {}, cookie, token)[0], 409)
+
+    # ------------------------------------------------------------------
+    # missing entities
+    # ------------------------------------------------------------------
+
+    def test_missing_run_returns_404(self) -> None:
+        cookie, token = self._session()
+        missing = uuid4()
+        for path in (
+            f"/runs/{missing}/start",
+            f"/runs/{missing}/complete",
+            f"/runs/{missing}/cancel",
+        ):
+            self.assertEqual(self._post(path, {}, cookie, token)[0], 404)
+        self.assertEqual(
+            self._post(
+                f"/runs/{missing}/items/{uuid4()}/complete", {}, cookie, token
+            )[0],
+            404,
+        )
+
+    def test_missing_item_returns_404(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        self._add_item(run_id, cookie, token)
+        self.assertEqual(self._post(f"/runs/{run_id}/start", {}, cookie, token)[0], 303)
+        self.assertEqual(
+            self._post(f"/runs/{run_id}/items/{uuid4()}/complete", {}, cookie, token)[0], 404
+        )
+
+    def test_item_from_another_run_returns_404(self) -> None:
+        cookie, token = self._session()
+        first_run = self._create_run(cookie, token)
+        second_run = self._create_run(cookie, token)
+        foreign = self._add_item(second_run, cookie, token, "чужа")
+        self._add_item(first_run, cookie, token, "своя")
+        self.assertEqual(self._post(f"/runs/{first_run}/start", {}, cookie, token)[0], 303)
+        self.assertEqual(
+            self._post(
+                f"/runs/{first_run}/items/{foreign.id}/complete", {}, cookie, token
+            )[0],
+            404,
+        )
+        self.assertEqual(self._item_status(foreign.id), ProcurementItemStatus.DRAFT)
+
+    def test_deleted_item_returns_404(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        removed = self._add_item(run_id, cookie, token, "видалити")
+        self._add_item(run_id, cookie, token, "залишити")
+        with SqliteUnitOfWork(self.db, immediate=True) as uow:
+            self.assertTrue(uow.items.soft_delete(
+                run_id, removed.id, ProcurementItemStatus.DRAFT
+            ))
+        self.assertEqual(self._post(f"/runs/{run_id}/start", {}, cookie, token)[0], 303)
+        self.assertEqual(
+            self._post(f"/runs/{run_id}/items/{removed.id}/complete", {}, cookie, token)[0], 404
+        )
+
+    # ------------------------------------------------------------------
+    # security
+    # ------------------------------------------------------------------
+
+    def test_lifecycle_post_requires_csrf_token(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        self._add_item(run_id, cookie, token)
+
+        self.assertEqual(
+            self._post(f"/runs/{run_id}/start", {}, cookie, token, include_csrf=False)[0], 403
+        )
+        self.assertEqual(
+            self._post(f"/runs/{run_id}/start", {}, cookie, token, csrf="wrong-token")[0], 403
+        )
+        duplicate = urlencode(
+            [("csrf_token", token), ("csrf_token", token)]
+        ).encode("utf-8")
+        self.assertEqual(
+            self._request(
+                "POST", f"/runs/{run_id}/start", cookie=cookie, body=duplicate,
+                content_type="application/x-www-form-urlencoded", origin=self.base,
+            )[0],
+            403,
+        )
+        self.assertEqual(self._run_status(run_id), ReviewRunStatus.DRAFT)
+
+    def test_lifecycle_post_rejects_foreign_origin(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        self._add_item(run_id, cookie, token)
+        self.assertEqual(
+            self._post(
+                f"/runs/{run_id}/start", {}, cookie, token, origin="http://evil.example"
+            )[0],
+            403,
+        )
+        self.assertEqual(
+            self._post(f"/runs/{run_id}/start", {}, cookie, token, origin="")[0], 403
+        )
+        self.assertEqual(self._run_status(run_id), ReviewRunStatus.DRAFT)
+
+    def test_lifecycle_post_rejects_foreign_host(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        self._add_item(run_id, cookie, token)
+        self.assertEqual(
+            self._post(f"/runs/{run_id}/start", {}, cookie, token, host="evil.example")[0], 403
+        )
+        self.assertEqual(self._run_status(run_id), ReviewRunStatus.DRAFT)
+
+    # ------------------------------------------------------------------
+    # method handling and concurrency
+    # ------------------------------------------------------------------
+
+    def test_get_on_action_paths_returns_404(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        item = self._add_item(run_id, cookie, token)
+        for path in (
+            f"/runs/{run_id}/start",
+            f"/runs/{run_id}/complete",
+            f"/runs/{run_id}/cancel",
+            f"/runs/{run_id}/items/{item.id}/complete",
+            f"/runs/{run_id}/items/{item.id}/fail",
+            f"/runs/{run_id}/items/{item.id}/retry",
+        ):
+            status, _, _ = self._request("GET", path)
+            self.assertEqual(status, 404, path)
+        self.assertEqual(self._run_status(run_id), ReviewRunStatus.DRAFT)
+
+    def test_concurrent_start_only_one_succeeds(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        self._add_item(run_id, cookie, token)
+        barrier = threading.Barrier(2)
+        results: list[int] = []
+        errors: list[BaseException] = []
+
+        def start() -> None:
+            barrier.wait()
+            try:
+                results.append(self._post(f"/runs/{run_id}/start", {}, cookie, token)[0])
+            except BaseException as exc:  # pragma: no cover - defensive
+                errors.append(exc)
+
+        workers = [threading.Thread(target=start) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=20)
+        self.assertFalse(errors)
+        self.assertCountEqual(results, [303, 409])
+        self.assertEqual(self._run_status(run_id), ReviewRunStatus.RUNNING)
+
+    def test_concurrent_item_complete_only_one_succeeds(self) -> None:
+        cookie, token = self._session()
+        run_id = self._create_run(cookie, token)
+        item = self._add_item(run_id, cookie, token)
+        self.assertEqual(self._post(f"/runs/{run_id}/start", {}, cookie, token)[0], 303)
+        barrier = threading.Barrier(2)
+        results: list[int] = []
+        errors: list[BaseException] = []
+
+        def complete() -> None:
+            barrier.wait()
+            try:
+                results.append(
+                    self._post(f"/runs/{run_id}/items/{item.id}/complete", {}, cookie, token)[0]
+                )
+            except BaseException as exc:  # pragma: no cover - defensive
+                errors.append(exc)
+
+        workers = [threading.Thread(target=complete) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=20)
+        self.assertFalse(errors)
+        self.assertCountEqual(results, [303, 409])
+        self.assertEqual(self._item_status(item.id), ProcurementItemStatus.COMPLETED)
 
 
 if __name__ == "__main__":

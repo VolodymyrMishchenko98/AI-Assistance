@@ -6,6 +6,7 @@ from .commands import (
     CreateImportPreviewCommand,
     CreateReviewRunCommand,
     ExcludeImportRowCommand,
+    SetProcurementItemStatusCommand,
     StartReviewRunCommand,
     UpdateImportRowCommand,
 )
@@ -96,6 +97,43 @@ class PriceCheckerApplication:
                 ReviewRunDto(run.id, run.status, run.created_at, len(uow.items.list_for_run(run.id)))
                 for run in uow.runs.list()
             ]
+
+    def set_procurement_item_status(self, command: SetProcurementItemStatusCommand) -> ProcurementItemDto:
+        with self._write_unit_of_work() as uow:
+            run = uow.runs.get(command.run_id)
+            if run is None:
+                raise LookupError(f"review run not found: {command.run_id}")
+            if run.status is not ReviewRunStatus.RUNNING:
+                raise InvalidTransitionError(
+                    f"cannot change item status while review run is {run.status.value}"
+                )
+            item = uow.items.get(command.run_id, command.item_id)
+            if item is None:
+                raise LookupError(f"procurement item not found: {command.item_id}")
+            previous = item.status
+            item.transition_to(command.status)
+            if not uow.items.update_status(item.id, previous, command.status):
+                raise ConcurrencyError("procurement item changed concurrently")
+            event_type = {
+                ProcurementItemStatus.COMPLETED: "procurement_item_completed",
+                ProcurementItemStatus.FAILED: "procurement_item_failed",
+                ProcurementItemStatus.PENDING: "procurement_item_retried",
+            }[command.status]
+            uow.audit.append(AuditEvent(
+                event_type,
+                "procurement_item",
+                item.id,
+                {
+                    "run_id": str(command.run_id),
+                    "item_id": str(item.id),
+                    "from_status": previous.value,
+                    "to_status": command.status.value,
+                },
+            ))
+            return ProcurementItemDto(
+                item.id, command.run_id, item.name, item.description,
+                item.quantity, item.unit, item.status, item.created_at,
+            )
 
     def start_review_run(self, command: StartReviewRunCommand) -> ReviewRunDto:
         with self._write_unit_of_work() as uow:

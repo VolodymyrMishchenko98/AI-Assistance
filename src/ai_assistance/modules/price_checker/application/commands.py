@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from uuid import UUID
 
+from ..domain.models import ProcurementItemStatus
+
 
 @dataclass(frozen=True, slots=True)
 class CreateReviewRunCommand:
@@ -30,6 +32,13 @@ class AddProcurementItemCommand:
     description: str | None = None
     quantity: Decimal | None = None
     unit: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SetProcurementItemStatusCommand:
+    run_id: UUID
+    item_id: UUID
+    status: ProcurementItemStatus
 
 
 @dataclass(frozen=True, slots=True)

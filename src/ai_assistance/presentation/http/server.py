@@ -20,15 +20,24 @@ import tempfile
 from ...config import validate_loopback_host
 from ...modules.price_checker.application.commands import (
     AddProcurementItemCommand,
+    CancelReviewRunCommand,
+    CompleteReviewRunCommand,
     ConfirmImportCommand,
     CreateImportPreviewCommand,
     CreateReviewRunCommand,
     ExcludeImportRowCommand,
+    SetProcurementItemStatusCommand,
+    StartReviewRunCommand,
     UpdateImportRowCommand,
 )
 from ...modules.price_checker.application.errors import ConcurrencyError
 from ...modules.price_checker.application.services import PriceCheckerApplication
-from ...modules.price_checker.domain.models import InvalidTransitionError, ValidationError
+from ...modules.price_checker.domain.models import (
+    InvalidTransitionError,
+    ProcurementItemStatus,
+    ReviewRunStatus,
+    ValidationError,
+)
 
 
 SESSION_COOKIE = "pc_session"
@@ -36,6 +45,69 @@ _SESSION_TTL_SECONDS = 8 * 60 * 60
 _MAX_SESSIONS = 1024
 _MAX_MULTIPART_PARTS = 1000
 _SESSION_STORE_LOCK = threading.Lock()
+
+_RUN_ACTION_PATH = re.compile(r"^/runs/([^/]+)/(start|complete|cancel)$")
+_ITEM_ACTION_PATH = re.compile(r"^/runs/([^/]+)/items/([^/]+)/(complete|fail|retry)$")
+
+_RUN_STATUS_LABELS = {
+    ReviewRunStatus.DRAFT: "Чернетка",
+    ReviewRunStatus.RUNNING: "Виконується",
+    ReviewRunStatus.COMPLETED: "Завершено",
+    ReviewRunStatus.CANCELLED: "Скасовано",
+}
+
+_ITEM_STATUS_LABELS = {
+    ProcurementItemStatus.DRAFT: "Чернетка",
+    ProcurementItemStatus.PENDING: "Очікує",
+    ProcurementItemStatus.FAILED: "Помилка",
+    ProcurementItemStatus.COMPLETED: "Завершено",
+}
+
+_ITEM_ACTION_LABELS = {
+    ProcurementItemStatus.PENDING: (("complete", "Позначити виконаною"), ("fail", "Позначити помилкою")),
+    ProcurementItemStatus.FAILED: (("retry", "Повторити"),),
+}
+
+_ITEM_ACTION_TARGETS = {
+    "complete": ProcurementItemStatus.COMPLETED,
+    "fail": ProcurementItemStatus.FAILED,
+    "retry": ProcurementItemStatus.PENDING,
+}
+
+
+def _run_action_forms(run_id: UUID, status: ReviewRunStatus, item_count: int) -> str:
+    if status is ReviewRunStatus.DRAFT:
+        disabled = " disabled" if item_count == 0 else ""
+        hint = (
+            ""
+            if item_count
+            else "<p>Щоб почати перевірку, додайте хоча б одну активну позицію.</p>"
+        )
+        return (
+            hint
+            + f'<form method="post" action="/runs/{run_id}/start">'
+            f'<button{disabled}>Почати перевірку</button></form>'
+            + f'<form method="post" action="/runs/{run_id}/cancel">'
+            '<button>Скасувати перевірку</button></form>'
+        )
+    if status is ReviewRunStatus.RUNNING:
+        return (
+            f'<form method="post" action="/runs/{run_id}/complete">'
+            '<button>Завершити перевірку</button></form>'
+            f'<form method="post" action="/runs/{run_id}/cancel">'
+            '<button>Скасувати перевірку</button></form>'
+        )
+    return ""
+
+
+def _item_action_forms(run_id: UUID, item, status: ReviewRunStatus) -> str:
+    if status is not ReviewRunStatus.RUNNING:
+        return ""
+    return "".join(
+        f'<form method="post" action="/runs/{run_id}/items/{item.id}/{action}">'
+        f'<button>{escape(label)}</button></form>'
+        for action, label in _ITEM_ACTION_LABELS.get(item.status, ())
+    )
 
 
 class SessionStore:
@@ -297,7 +369,13 @@ class LocalRequestHandler(BaseHTTPRequestHandler):
             (parsed.path.startswith("/runs/") and "/imports/" in parsed.path)
             or parsed.path.startswith("/imports/")
         )
-        is_run_page = parsed.path.startswith("/runs/") and not parsed.path.endswith("/items") and not is_import_page
+        is_run_page = (
+            parsed.path.startswith("/runs/")
+            and not parsed.path.endswith("/items")
+            and not is_import_page
+            and _RUN_ACTION_PATH.match(parsed.path) is None
+            and _ITEM_ACTION_PATH.match(parsed.path) is None
+        )
         if parsed.path != "/" and not is_run_page and not is_import_page:
             self._send_error(404, "Сторінку не знайдено")
             return
@@ -314,23 +392,33 @@ class LocalRequestHandler(BaseHTTPRequestHandler):
             form = ""
             if selected_id is not None:
                 run_id = UUID(selected_id)
+                run = next((candidate for candidate in runs if candidate.id == run_id), None)
+                if run is None:
+                    raise LookupError(f"review run not found: {run_id}")
                 items = self.application.list_procurement_items(run_id)
                 item_rows = "".join(
                     f"<li>{escape(item.name)} — {escape(str(item.quantity))} "
                     f"{escape(item.unit or '')}"
-                    f"{(' — ' + escape(item.description)) if item.description else ''}</li>"
+                    f"{(' — ' + escape(item.description)) if item.description else ''}"
+                    f" — статус: {escape(_ITEM_STATUS_LABELS[item.status])}"
+                    f"{_item_action_forms(run_id, item, run.status)}</li>"
                     for item in items
                 ) or "<li>Позицій ще немає</li>"
-                form = f'''<h2>Додати закупівельну позицію</h2>
+                form = f'''<h2>Перевірка</h2>
+<p>Статус: {escape(_RUN_STATUS_LABELS[run.status])}. Позицій: {len(items)}.</p>
+{_run_action_forms(run_id, run.status, len(items))}'''
+                if run.status is ReviewRunStatus.DRAFT:
+                    form += f'''<h2>Додати закупівельну позицію</h2>
 <form method="post" action="/runs/{run_id}/items">
 <label>Назва <input name="name" required></label><br>
 <label>Кількість <input name="quantity" required></label><br>
 <label>Одиниця виміру <input name="unit" required></label><br>
 <label>Технічні характеристики <textarea name="description"></textarea></label><br>
-<button>Додати позицію</button></form>
-<h2>Позиції</h2><ul>{item_rows}</ul>'''
-                upload_idempotency_key = uuid4()
-                form += f'''<h2>Імпорт XLSX</h2>
+<button>Додати позицію</button></form>'''
+                form += f'''<h2>Позиції</h2><ul>{item_rows}</ul>'''
+                if run.status is ReviewRunStatus.DRAFT:
+                    upload_idempotency_key = uuid4()
+                    form += f'''<h2>Імпорт XLSX</h2>
 <form method="post" enctype="multipart/form-data" action="/runs/{run_id}/imports/preview">
 <input type="hidden" name="idempotency_key" value="{escape(str(upload_idempotency_key))}">
 <label>Файл XLSX <input type="file" name="file" accept=".xlsx" required></label><br>
@@ -394,7 +482,18 @@ class LocalRequestHandler(BaseHTTPRequestHandler):
         is_confirm = path.startswith("/runs/") and "/imports/" in path and path.endswith("/confirm")
         is_exclude = path.startswith("/runs/") and "/imports/" in path and "/rows/" in path and path.endswith("/exclude")
         is_update = path.startswith("/runs/") and "/imports/" in path and "/rows/" in path and not is_exclude
-        if path != "/runs" and not is_item and not is_preview and not is_confirm and not is_exclude and not is_update:
+        run_action = _RUN_ACTION_PATH.match(path)
+        item_action = _ITEM_ACTION_PATH.match(path)
+        if (
+            path != "/runs"
+            and not is_item
+            and not is_preview
+            and not is_confirm
+            and not is_exclude
+            and not is_update
+            and run_action is None
+            and item_action is None
+        ):
             self._send_error(404, "Сторінку не знайдено")
             return
         if not self._check_host():
@@ -456,7 +555,24 @@ class LocalRequestHandler(BaseHTTPRequestHandler):
                 self.send_header("Location", f"/runs/{run_id}/imports/{preview.id}")
                 self.end_headers()
                 return
-            if is_confirm:
+            if run_action is not None:
+                run_id = UUID(run_action.group(1))
+                action = run_action.group(2)
+                if action == "start":
+                    self.application.start_review_run(StartReviewRunCommand(run_id))
+                elif action == "complete":
+                    self.application.complete_review_run(CompleteReviewRunCommand(run_id))
+                else:
+                    self.application.cancel_review_run(CancelReviewRunCommand(run_id))
+                location = f"/runs/{run_id}"
+            elif item_action is not None:
+                run_id = UUID(item_action.group(1))
+                item_id = UUID(item_action.group(2))
+                self.application.set_procurement_item_status(SetProcurementItemStatusCommand(
+                    run_id, item_id, _ITEM_ACTION_TARGETS[item_action.group(3)],
+                ))
+                location = f"/runs/{run_id}"
+            elif is_confirm:
                 run_path, rest = path.split("/imports/", 1)
                 run_id = UUID(run_path[len("/runs/"):])
                 preview_id = UUID(rest[:-len("/confirm")])
