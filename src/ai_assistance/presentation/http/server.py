@@ -12,7 +12,7 @@ import socket
 import threading
 import time
 from urllib.parse import parse_qs, urlsplit
-from uuid import UUID
+from uuid import UUID, uuid4
 import os
 import re
 import tempfile
@@ -329,9 +329,10 @@ class LocalRequestHandler(BaseHTTPRequestHandler):
 <label>Технічні характеристики <textarea name="description"></textarea></label><br>
 <button>Додати позицію</button></form>
 <h2>Позиції</h2><ul>{item_rows}</ul>'''
+                upload_idempotency_key = uuid4()
                 form += f'''<h2>Імпорт XLSX</h2>
 <form method="post" enctype="multipart/form-data" action="/runs/{run_id}/imports/preview">
-<input type="hidden" name="idempotency_key" value="{run_id}-new">
+<input type="hidden" name="idempotency_key" value="{escape(str(upload_idempotency_key))}">
 <label>Файл XLSX <input type="file" name="file" accept=".xlsx" required></label><br>
 <label>Лист <input name="sheet" required></label><br>
 <label>Рядок заголовків <input name="header_row" value="1" required></label><br>

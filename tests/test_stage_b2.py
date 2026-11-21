@@ -1,4 +1,5 @@
 import hashlib
+import http.client
 import re
 import threading
 import unittest
@@ -49,10 +50,73 @@ class StageB2Tests(unittest.TestCase):
         self.db.close()
         self.tmp.cleanup()
 
-    def command(self, key: str = "operation-1") -> CreateImportPreviewCommand:
+    def command(self, key: str = "operation-1", fingerprint: str | None = None) -> CreateImportPreviewCommand:
         return CreateImportPreviewCommand(
-            self.run.id, str(self.source), hashlib.sha256(b"fake-xlsx").hexdigest(), key,
+            self.run.id, str(self.source), fingerprint or hashlib.sha256(b"fake-xlsx").hexdigest(), key,
             "Закупівля", 1, {"name": "Назва", "quantity": "Кількість", "unit": "Одиниця", "description": "Характеристики"},
+        )
+
+    def _count(self, table: str) -> int:
+        with self.db.transaction() as connection:
+            return connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+    def _http(self, method: str, url: str, *, cookie: str | None = None, body: bytes | None = None,
+              content_type: str | None = None, origin: str | None = None):
+        parsed = urlsplit(url)
+        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+        headers = {}
+        if cookie is not None:
+            headers["Cookie"] = cookie
+        if content_type is not None:
+            headers["Content-Type"] = content_type
+        if origin is not None:
+            headers["Origin"] = origin
+        if body is not None:
+            headers["Content-Length"] = str(len(body))
+        try:
+            connection.request(method, parsed.path, body=body, headers=headers)
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            connection.close()
+
+    def _fetch_upload_form(self, base: str, run_id, cookie: str | None = None) -> tuple[str, str, str]:
+        status, headers, body = self._http("GET", f"{base}/runs/{run_id}", cookie=cookie)
+        self.assertEqual(status, 200)
+        set_cookie = headers.get("Set-Cookie")
+        session_cookie = set_cookie.split(";")[0] if set_cookie else cookie
+        self.assertIsNotNone(session_cookie)
+        text = body.decode("utf-8")
+        token = re.search(r'name="csrf_token" value="([^"]+)"', text).group(1)
+        keys = re.findall(r'name="idempotency_key" value="([^"]*)"', text)
+        self.assertEqual(len(keys), 1)
+        return keys[0], token, session_cookie
+
+    def _post_import(self, base: str, run_id, key: str, token: str, cookie: str, payload: bytes,
+                     filename: str = "items.xlsx"):
+        boundary = "stage-b2-upload-boundary"
+        fields = {
+            "idempotency_key": key,
+            "sheet": "Закупівля",
+            "header_row": "1",
+            "name_column": "Назва",
+            "quantity_column": "Кількість",
+            "unit_column": "Одиниця",
+            "csrf_token": token,
+        }
+        chunks = [
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+            for name, value in fields.items()
+        ]
+        chunks.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f"Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n".encode()
+            + payload
+            + f"\r\n--{boundary}--\r\n".encode()
+        )
+        return self._http(
+            "POST", f"{base}/runs/{run_id}/imports/preview", cookie=cookie, body=b"".join(chunks),
+            content_type=f"multipart/form-data; boundary={boundary}", origin=base,
         )
 
     def test_preview_does_not_change_items_and_confirm_is_idempotent(self) -> None:
@@ -93,6 +157,27 @@ class StageB2Tests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             self.app.create_import_preview(changed)
+        self.assertEqual(self._count("import_operations"), 1)
+
+    def test_two_different_files_create_separate_previews_in_one_run(self) -> None:
+        first = self.app.create_import_preview(self.command("upload-one", "fingerprint-one"))
+        second = self.app.create_import_preview(self.command("upload-two", "fingerprint-two"))
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(self._count("import_operations"), 2)
+        self.assertEqual(self.app.get_import_preview(first.id, self.run.id).source_fingerprint, "fingerprint-one")
+        self.assertEqual(self.app.get_import_preview(second.id, self.run.id).source_fingerprint, "fingerprint-two")
+
+    def test_retry_of_same_operation_returns_existing_preview(self) -> None:
+        first = self.app.create_import_preview(self.command("upload-retry", "fingerprint-retry"))
+        retry = self.app.create_import_preview(self.command("upload-retry", "fingerprint-retry"))
+        self.assertEqual(retry.id, first.id)
+        self.assertEqual(self._count("import_operations"), 1)
+
+    def test_same_file_with_new_key_creates_new_preview(self) -> None:
+        first = self.app.create_import_preview(self.command("upload-first", "fingerprint-same"))
+        second = self.app.create_import_preview(self.command("upload-second", "fingerprint-same"))
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(self._count("import_operations"), 2)
 
     def test_closed_run_is_checked_at_confirmation(self) -> None:
         preview = self.app.create_import_preview(self.command("closed-operation"))
@@ -806,6 +891,55 @@ class StageB2Tests(unittest.TestCase):
                 headers={"Origin": url, "Cookie": cookie},
             )):
                 pass
+            self.assertEqual(len(self.app.list_procurement_items(self.run.id)), 2)
+        finally:
+            server.shutdown(); server.server_close(); thread.join(timeout=3)
+
+    def test_http_upload_form_issues_unique_keys_and_retries_are_idempotent(self) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), type("Handler", (LocalRequestHandler,), {"application": self.app}))
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        second_file = Path(self.tmp.name) / "second.xlsx"
+        second_file.write_bytes(b"fake-xlsx-second")
+        try:
+            first_key, token, cookie = self._fetch_upload_form(base, self.run.id)
+            second_key, _, _ = self._fetch_upload_form(base, self.run.id, cookie)
+            self.assertTrue(first_key)
+            self.assertTrue(second_key)
+            self.assertNotEqual(first_key, second_key)
+            UUID(second_key)
+
+            status, headers, _ = self._post_import(base, self.run.id, first_key, token, cookie, self.source.read_bytes())
+            self.assertEqual(status, 303)
+            first_location = headers["Location"]
+            status, headers, _ = self._post_import(base, self.run.id, first_key, token, cookie, self.source.read_bytes())
+            self.assertEqual(status, 303)
+            self.assertEqual(headers["Location"], first_location)
+            self.assertEqual(self._count("import_operations"), 1)
+
+            status, headers, _ = self._post_import(base, self.run.id, second_key, token, cookie, second_file.read_bytes())
+            self.assertEqual(status, 303)
+            self.assertNotEqual(headers["Location"], first_location)
+            self.assertEqual(self._count("import_operations"), 2)
+
+            status, _, _ = self._post_import(base, self.run.id, first_key, token, cookie, second_file.read_bytes())
+            self.assertEqual(status, 400)
+            self.assertEqual(self._count("import_operations"), 2)
+
+            preview_id = UUID(urlsplit(first_location).path.rsplit("/", 1)[-1])
+            confirm = urlencode({
+                "idempotency_key": first_key,
+                "acknowledge_warnings": "on",
+                "csrf_token": token,
+            }).encode()
+            for _ in range(2):
+                status, _, _ = self._http(
+                    "POST", f"{base}/runs/{self.run.id}/imports/{preview_id}/confirm",
+                    cookie=cookie, body=confirm,
+                    content_type="application/x-www-form-urlencoded", origin=base,
+                )
+                self.assertEqual(status, 303)
             self.assertEqual(len(self.app.list_procurement_items(self.run.id)), 2)
         finally:
             server.shutdown(); server.server_close(); thread.join(timeout=3)
