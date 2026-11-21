@@ -1,4 +1,5 @@
 import hashlib
+import re
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -771,17 +772,39 @@ class StageB2Tests(unittest.TestCase):
             "quantity_column": "Кількість",
             "unit_column": "Одиниця",
         }
-        chunks = []
-        for key, value in fields.items():
-            chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode())
-        chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="items.xlsx"\r\nContent-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\nfake-xlsx\r\n--{boundary}--\r\n'.encode())
-        body = b"".join(chunks)
         url = f"http://127.0.0.1:{server.server_address[1]}"
         try:
-            response = urlopen(Request(f"{url}/runs/{self.run.id}/imports/preview", data=body, method="POST", headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}))
+            with urlopen(f"{url}/runs/{self.run.id}") as page:
+                cookie = page.headers.get("Set-Cookie").split(";")[0]
+                token = re.search(r'name="csrf_token" value="([^"]+)"', page.read().decode("utf-8")).group(1)
+            fields["csrf_token"] = token
+            chunks = []
+            for key, value in fields.items():
+                chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode())
+            chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="items.xlsx"\r\nContent-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\nfake-xlsx\r\n--{boundary}--\r\n'.encode())
+            body = b"".join(chunks)
+            response = urlopen(Request(
+                f"{url}/runs/{self.run.id}/imports/preview",
+                data=body,
+                method="POST",
+                headers={
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "Origin": url,
+                    "Cookie": cookie,
+                },
+            ))
             preview_id = UUID(urlsplit(response.geturl()).path.split("/")[-1])
-            confirm = urlencode({"idempotency_key": "http-operation", "acknowledge_warnings": "on"}).encode()
-            with urlopen(Request(f"{url}/runs/{self.run.id}/imports/{preview_id}/confirm", data=confirm, method="POST")):
+            confirm = urlencode({
+                "idempotency_key": "http-operation",
+                "acknowledge_warnings": "on",
+                "csrf_token": token,
+            }).encode()
+            with urlopen(Request(
+                f"{url}/runs/{self.run.id}/imports/{preview_id}/confirm",
+                data=confirm,
+                method="POST",
+                headers={"Origin": url, "Cookie": cookie},
+            )):
                 pass
             self.assertEqual(len(self.app.list_procurement_items(self.run.id)), 2)
         finally:

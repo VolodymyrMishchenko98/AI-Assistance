@@ -1,3 +1,4 @@
+import re
 import threading
 import unittest
 from decimal import Decimal
@@ -73,11 +74,17 @@ class StageB1Tests(unittest.TestCase):
         base = f"http://127.0.0.1:{server.server_address[1]}"
         try:
             with urlopen(f"{base}/runs/{self.run.id}") as response:
-                self.assertIn("Додати закупівельну позицію".encode(), response.read())
+                page = response.read()
+                cookie = response.headers.get("Set-Cookie")
+            self.assertIn("Додати закупівельну позицію".encode(), page)
+            token = re.search(r'name="csrf_token" value="([^"]+)"', page.decode("utf-8")).group(1)
             request = Request(
                 f"{base}/runs/{self.run.id}/items",
-                data=urlencode({"name": "насос", "quantity": "0", "unit": "шт."}).encode(),
+                data=urlencode({
+                    "name": "насос", "quantity": "0", "unit": "шт.", "csrf_token": token,
+                }).encode(),
                 method="POST",
+                headers={"Origin": base, "Cookie": cookie.split(";")[0]},
             )
             with self.assertRaises(HTTPError) as context:
                 urlopen(request)

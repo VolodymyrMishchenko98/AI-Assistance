@@ -57,11 +57,18 @@ class PresentationTests(unittest.TestCase):
             server = ThreadingHTTPServer(("127.0.0.1", 0), type("Handler", (LocalRequestHandler,), {"application": application}))
             thread = threading.Thread(target=server.serve_forever)
             thread.start()
+            base = f"http://127.0.0.1:{server.server_address[1]}"
             try:
+                with urlopen(f"{base}/", timeout=2) as page:
+                    cookie = page.headers.get("Set-Cookie").split(";")[0]
                 request = Request(
-                    f"http://127.0.0.1:{server.server_address[1]}/runs",
+                    f"{base}/runs",
                     data=b"%FF", method="POST",
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Origin": base,
+                        "Cookie": cookie,
+                    },
                 )
                 try:
                     urlopen(request, timeout=2)
